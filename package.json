@@ -1,0 +1,32 @@
+{
+  "name": "pi-shadow-rewind",
+  "version": "0.1.0",
+  "description": "Cursor-style checkpoint/rewind for Pi — shadow-git snapshots stored outside the cwd, capturing only agent-touched files so it stays fast even in ~.",
+  "keywords": [
+    "checkpoint",
+    "extension",
+    "pi",
+    "pi-package",
+    "rewind",
+    "shadow-git"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "README.md"
+  ]
+}
