@@ -30,7 +30,10 @@ import type {
 
 const EXT = 'shadow-rewind'
 const GIT_TIMEOUT = 30_000
-const CHECKPOINTS_DIR = path.join(homedir(), '.pi', 'agent', 'checkpoints')
+// Overridable so tests never write into the real checkpoint store.
+function checkpointsDir(): string {
+  return process.env.PI_SHADOW_REWIND_DIR ?? path.join(homedir(), '.pi', 'agent', 'checkpoints')
+}
 const META_FILE = 'pi-checkpoint-meta.json'
 
 // Tools that mutate the worktree and therefore must seed the shadow index.
@@ -138,7 +141,9 @@ export default function shadowRewind(pi: ExtensionAPI) {
 
     try {
       const snap = getSnapshotter(ctx)
-      const afterSnapshot = await snap.track(touchedThisTurn)
+      const afterSnapshot = await snap.track(touchedThisTurn, (warning) =>
+        ctx.ui.notify(`Checkpoint warning: ${warning}`, 'warning'),
+      )
       const files = await snap.diffFiles(current.beforeSnapshot, afterSnapshot)
       const checkpoint: Checkpoint = {
         ...current,
@@ -165,13 +170,17 @@ export default function shadowRewind(pi: ExtensionAPI) {
     if (!ctx.hasUI) return
     if (event.preparation.userWantsSummary) return
 
-    const branch = ctx.sessionManager.getBranch()
-    const resolved = resolveSnapshotForTarget(branch, event.preparation.targetId, checkpoints)
+    const resolved = resolveSnapshotForTarget(
+      ctx.sessionManager,
+      event.preparation.targetId,
+      checkpoints,
+    )
     if (!resolved || resolved.checkpoint.files.length === 0) return
 
+    const prompt = truncate(resolved.checkpoint.prompt, 60)
     const ok = await ctx.ui.confirm(
       'Sync files?',
-      `Restore ${resolved.checkpoint.files.length} file(s) to checkpoint "${truncate(resolved.checkpoint.prompt, 60)}"?`,
+      `Restore ${resolved.checkpoint.files.length} file(s) to checkpoint "${prompt}"?`,
     )
     if (!ok) return
     try {
@@ -182,52 +191,24 @@ export default function shadowRewind(pi: ExtensionAPI) {
     }
   })
 
+  /**
+   * Work out which snapshot describes the file state at `targetId`.
+   *
+   * The branch is the path from the root to the TARGET, not the current leaf:
+   * navigating to another branch must not pick up that branch's checkpoints.
+   */
   function resolveSnapshotForTarget(
-    branch: SessionEntry[],
+    sessions: ReadonlySessionLookup,
     targetId: string,
     store: Map<string, Checkpoint>,
   ): { checkpoint: Checkpoint; snapshot: string } | undefined {
     if (!targetId || store.size === 0) return undefined
 
-    // Case 1: target IS the userEntry of a checkpoint → user navigated to the
-    // prompt. Restore the BEFORE-snapshot (file state as it was when the user
-    // sent the prompt, i.e. before the agent's edits this turn).
-    const asUserEntry = [...store.values()].find((c) => c.userEntryId === targetId)
-    if (asUserEntry) {
-      return { checkpoint: asUserEntry, snapshot: asUserEntry.beforeSnapshot }
-    }
+    // getBranch falls back to the current leaf for unknown ids — refuse.
+    const branch = sessions.getBranch(targetId)
+    if (branch[branch.length - 1]?.id !== targetId) return undefined
 
-    // Case 2: target IS the finalLeafId of a checkpoint → user navigated to
-    // the end of an agent turn. Restore the AFTER-snapshot (file state after
-    // the agent's edits this turn).
-    const asFinalLeaf = [...store.values()].find((c) => c.finalLeafId === targetId)
-    if (asFinalLeaf) {
-      return { checkpoint: asFinalLeaf, snapshot: asFinalLeaf.afterSnapshot }
-    }
-
-    // Case 3: target is somewhere else on the branch. Walk the branch in order
-    // and find which checkpoint's [userEntryId, finalLeafId] interval contains
-    // targetId. If targetId falls AFTER finalLeafId of checkpoint X but BEFORE
-    // userEntryId of checkpoint X+1, the file state is afterSnapshot of X.
-    // If targetId falls BEFORE the first checkpoint's userEntryId, the file
-    // state is beforeSnapshot of the first checkpoint (everything those files
-    // touched should be reverted).
-    const targetIdx = branch.findIndex((e) => e.id === targetId)
-    if (targetIdx === -1) return undefined
-
-    const sorted = [...store.values()].sort((a, b) => a.createdAt - b.createdAt)
-    // First checkpoint whose userEntryId comes at-or-after target on the branch.
-    const firstAfterTarget = sorted.find((cp) => {
-      const cpUserIdx = branch.findIndex((e) => e.id === cp.userEntryId)
-      return cpUserIdx !== -1 && cpUserIdx >= targetIdx
-    })
-    if (firstAfterTarget) {
-      // target lies at or before this checkpoint's prompt → state is beforeSnapshot
-      return { checkpoint: firstAfterTarget, snapshot: firstAfterTarget.beforeSnapshot }
-    }
-    // target lies after the last checkpoint → afterSnapshot of the last checkpoint
-    const last = sorted[sorted.length - 1]
-    return { checkpoint: last, snapshot: last.afterSnapshot }
+    return pickSnapshotForTarget(branch, targetId, store)
   }
 
   // ==========================================================================
@@ -250,13 +231,13 @@ export default function shadowRewind(pi: ExtensionAPI) {
 
   pi.registerCommand('diff', {
     description:
-      'Show session diff. With no args: per-file line stats. With a file path: full unified diff for that file.',
+      'Show session diff. Without args: per-file line stats. With a file path: full diff for it.',
     getArgumentCompletions: (prefix) => diffFileCompletions(branchFiles, prefix),
     handler: async (args, ctx) => diff(ctx, args.trim()),
   })
 
   pi.registerCommand('shadow-checkpoints', {
-    description: 'Show disk usage of checkpoint snapshots across sessions and optionally delete them.',
+    description: 'Show disk usage of checkpoint snapshots across sessions and delete them.',
     handler: async (_args, ctx) => manageCheckpointCache(ctx),
   })
 
@@ -300,9 +281,13 @@ export default function shadowRewind(pi: ExtensionAPI) {
     if (choice === '↩ Undo last rewind' && redoStack.length > 0) {
       const undone = redoStack[redoStack.length - 1]
       try {
-        await getSnapshotter(ctx).restoreFiles(undone.afterSnapshot, undone.files)
         const result = await ctx.navigateTree(undone.finalLeafId, { summarize: false })
-        if (result.cancelled) return
+        if (result.cancelled) {
+          ctx.ui.notify('Undo cancelled', 'info')
+          return
+        }
+
+        await getSnapshotter(ctx).restoreFiles(undone.afterSnapshot, undone.files)
         redoStack.pop()
         ctx.ui.setEditorText('')
         refreshBranchFiles(ctx)
@@ -348,47 +333,56 @@ export default function shadowRewind(pi: ExtensionAPI) {
       'Files only (keep conversation)',
       'Conversation only (keep files)',
       'Cancel',
-    ]
-    const modeChoice = await ctx.ui.select('Restore mode:', RESTORE_OPTIONS)
-    if (!modeChoice || modeChoice === 'Cancel') {
+    ] as const
+    const modeChoice = await ctx.ui.select('Restore mode:', [...RESTORE_OPTIONS])
+    const mode = RESTORE_OPTIONS.find((option) => option === modeChoice)
+    if (!mode || mode === 'Cancel') {
       ctx.ui.notify('Rewind cancelled', 'info')
       return
     }
 
-    const doFiles = modeChoice === 'Restore all (files + conversation)' || modeChoice === 'Files only (keep conversation)'
-    const doConversation = modeChoice === 'Restore all (files + conversation)' || modeChoice === 'Conversation only (keep files)'
+    const doFiles = mode !== 'Conversation only (keep files)'
+    const doConversation = mode !== 'Files only (keep conversation)'
+
+    const leafBefore = ctx.sessionManager.getLeafId()
+
+    // Navigate FIRST: if another handler cancels, the files stay untouched and
+    // conversation and worktree cannot drift apart.
+    if (doConversation) {
+      try {
+        const leafId = target.beforeLeafId ?? target.userEntryId
+        const result = await ctx.navigateTree(leafId, { summarize: false })
+        if (result.cancelled) {
+          ctx.ui.notify('Rewind cancelled', 'info')
+          return
+        }
+      } catch (error) {
+        ctx.ui.notify(`Conversation rewind failed: ${message(error)}`, 'warning')
+        return
+      }
+    }
 
     if (doFiles) {
       try {
-        // Safety net: snapshot current state so /undo can bring it back.
         const snap = getSnapshotter(ctx)
+        // Safety net: snapshot current state so /undo can bring it back.
         const safetyBefore = await snap.track()
         // Restore files from the checkpoint's before-snapshot (pre-edit state).
         await snap.restoreFiles(target.beforeSnapshot, target.files)
-        // Record an undo entry bound to the current leaf.
-        const safetyCheckpoint: Checkpoint = {
+        redoStack.push({
           userEntryId: target.userEntryId,
           beforeLeafId: target.beforeLeafId,
-          finalLeafId: ctx.sessionManager.getLeafId() ?? target.userEntryId,
+          finalLeafId: leafBefore ?? target.userEntryId,
           prompt: target.prompt,
           beforeSnapshot: safetyBefore,
           afterSnapshot: target.afterSnapshot,
           files: target.files,
           createdAt: Date.now(),
-        }
-        redoStack.push(safetyCheckpoint)
+        })
         refreshBranchFiles(ctx)
       } catch (error) {
         ctx.ui.notify(`File restore failed: ${message(error)}`, 'error')
-      }
-    }
-
-    if (doConversation) {
-      try {
-        const leafId = target.beforeLeafId ?? target.userEntryId
-        await ctx.navigateTree(leafId, { summarize: false })
-      } catch (error) {
-        ctx.ui.notify(`Conversation rewind partially failed: ${message(error)}`, 'warning')
+        return
       }
     }
 
@@ -398,7 +392,11 @@ export default function shadowRewind(pi: ExtensionAPI) {
       ctx.ui.setEditorText('')
     }
 
-    const what = doFiles && doConversation ? 'files + conversation' : doFiles ? 'files' : 'conversation'
+    const what = doFiles
+      ? doConversation
+        ? 'files + conversation'
+        : 'files'
+      : 'conversation'
     ctx.ui.notify(`Rewound ${what} to checkpoint #${idx + 1}`, 'info')
   }
 
@@ -427,9 +425,14 @@ export default function shadowRewind(pi: ExtensionAPI) {
     }
 
     try {
-      await getSnapshotter(ctx).restoreFiles(checkpoint.beforeSnapshot, checkpoint.files)
+      // Navigate first so a cancelled navigation leaves the files untouched.
       const result = await ctx.navigateTree(checkpoint.beforeLeafId, { summarize: false })
-      if (result.cancelled) return
+      if (result.cancelled) {
+        ctx.ui.notify('Undo cancelled', 'info')
+        return
+      }
+
+      await getSnapshotter(ctx).restoreFiles(checkpoint.beforeSnapshot, checkpoint.files)
       redoStack.push(checkpoint)
       ctx.ui.setEditorText(checkpoint.prompt)
       refreshBranchFiles(ctx)
@@ -448,12 +451,15 @@ export default function shadowRewind(pi: ExtensionAPI) {
     }
 
     try {
-      await getSnapshotter(ctx).restoreFiles(checkpoint.afterSnapshot, checkpoint.files)
+      // Navigate first so a cancelled navigation leaves the files untouched.
       const result = await ctx.navigateTree(checkpoint.finalLeafId, { summarize: false })
       if (result.cancelled) {
         redoStack.push(checkpoint)
+        ctx.ui.notify('Redo cancelled', 'info')
         return
       }
+
+      await getSnapshotter(ctx).restoreFiles(checkpoint.afterSnapshot, checkpoint.files)
       ctx.ui.setEditorText('')
       refreshBranchFiles(ctx)
       ctx.ui.notify(`Redid message; restored ${checkpoint.files.length} file(s)`, 'info')
@@ -522,11 +528,15 @@ export default function shadowRewind(pi: ExtensionAPI) {
     for (const [f, { added, removed }] of sorted) {
       totalAdded += added
       totalRemoved += removed
-      output += `${t.fg('text', f)}  ${t.fg('toolDiffAdded', `+${added}`)}/${t.fg('toolDiffRemoved', `-${removed}`)}\n`
+      output += `${t.fg('text', f)}  `
+      output += `${t.fg('toolDiffAdded', `+${added}`)}/${t.fg('toolDiffRemoved', `-${removed}`)}\n`
     }
 
+    const addedText = t.fg('toolDiffAdded', `+${totalAdded}`)
+    const removedText = t.fg('toolDiffRemoved', `-${totalRemoved}`)
+    const fileCount = t.bold(String(sorted.length))
     output += `\n${t.fg('dim', 'Total')}\n`
-    output += `${t.fg('toolDiffAdded', `+${totalAdded}`)}/${t.fg('toolDiffRemoved', `-${totalRemoved}`)} across ${t.bold(String(sorted.length))} file(s)`
+    output += `${addedText}/${removedText} across ${fileCount} file(s)`
 
     ctx.ui.notify(output, 'info')
   }
@@ -586,17 +596,20 @@ export default function shadowRewind(pi: ExtensionAPI) {
 // it stages ONLY the given paths. Those paths come from tool_execution_end
 // for write/edit/bash, so the shadow index stays O(agent-touched-files).
 // ==========================================================================
-class ShadowGit {
+export class ShadowGit {
   private initialized = false
+  private readonly pi: ExtensionAPI
+  private readonly cwd: string
+  private readonly sessionId: string
   private readonly gitdir: string
 
-  constructor(
-    private readonly pi: ExtensionAPI,
-    private readonly cwd: string,
-    private readonly sessionId: string,
-  ) {
+  constructor(pi: ExtensionAPI, cwd: string, sessionId: string) {
+    this.pi = pi
+    this.cwd = cwd
+    this.sessionId = sessionId
+
     const key = createHash('sha256').update(`${cwd}\0${sessionId}`).digest('hex').slice(0, 24)
-    this.gitdir = path.join(CHECKPOINTS_DIR, key)
+    this.gitdir = path.join(checkpointsDir(), key)
   }
 
   /**
@@ -606,11 +619,15 @@ class ShadowGit {
    * holds" — typically empty on first turn, then the union of previously
    * touched files).
    */
-  async track(paths?: Iterable<string>): Promise<string> {
+  async track(paths?: Iterable<string>, onWarn?: (warning: string) => void): Promise<string> {
     await this.ensure()
     if (paths) {
-      await this.addPaths(paths)
+      const failures = await this.addPaths(paths)
+      for (const failure of failures) onWarn?.(failure)
     }
+    // Refresh the activity stamp so cache cleanup does not treat a busy store
+    // as stale (it is only written on creation otherwise).
+    await this.writeMeta()
     const result = await this.git(['write-tree'])
     return result.stdout.trim()
   }
@@ -667,6 +684,10 @@ class ShadowGit {
     for (const file of files) {
       const rel = normalizeGitPath(file)
       if (!rel) continue
+
+      // Never let a stored checkpoint path reach outside the worktree.
+      if (!isSafeRestoreTarget(this.cwd, rel)) continue
+
       const exists = await this.git(['ls-tree', snapshot, '--', rel], { allowFailure: true })
       if (exists.code === 0 && exists.stdout.trim()) {
         await this.git(['checkout', snapshot, '--', rel])
@@ -687,11 +708,13 @@ class ShadowGit {
     await this.git(['config', 'core.longpaths', 'true'])
     await this.git(['config', 'core.symlinks', 'true'])
     await this.git(['config', 'core.fsmonitor', 'false'])
-    await writeFile(
-      path.join(this.gitdir, META_FILE),
-      JSON.stringify({ cwd: this.cwd, sessionId: this.sessionId, updatedAt: Date.now() }),
-    ).catch(() => {})
+    await this.writeMeta()
     this.initialized = true
+  }
+
+  private async writeMeta(): Promise<void> {
+    const meta = { cwd: this.cwd, sessionId: this.sessionId, updatedAt: Date.now() }
+    await writeFile(path.join(this.gitdir, META_FILE), JSON.stringify(meta)).catch(() => {})
   }
 
   /**
@@ -699,16 +722,21 @@ class ShadowGit {
    * does NOT walk the worktree — it touches only the listed files, which is
    * what makes the extension fast in ~.
    *
+   * `-f` is required: the agent may edit a file the *project's* .gitignore
+   * excludes (.env, build output). Those changes must still be rewindable, so
+   * we force-add explicitly captured paths only.
+   *
    * Non-existent paths (e.g. a file deleted by `rm`) are removed from the
    * index via `git rm --cached`, so deletions are captured correctly.
    */
-  private async addPaths(paths: Iterable<string>): Promise<void> {
+  private async addPaths(paths: Iterable<string>): Promise<string[]> {
+    const failures: string[] = []
     const normalized = unique(
       [...paths]
         .map((p) => normalizeGitPath(p))
         .filter((p): p is string => Boolean(p)),
     )
-    if (normalized.length === 0) return
+    if (normalized.length === 0) return failures
 
     // Stage existing paths. `git add` tolerates missing files only with
     // `--ignore-missing`, but we want deletions to be reflected, so we
@@ -728,7 +756,10 @@ class ShadowGit {
     const BATCH = 100
     for (let i = 0; i < existing.length; i += BATCH) {
       const batch = existing.slice(i, i + BATCH)
-      await this.git(['add', '--', ...batch], { allowFailure: true })
+      const result = await this.git(['add', '-f', '--', ...batch], { allowFailure: true })
+      if (result.code !== 0) {
+        failures.push(result.stderr.trim() || `git add failed: ${batch.join(', ')}`)
+      }
     }
 
     // Remove deleted files from the index so the snapshot reflects their
@@ -736,6 +767,8 @@ class ShadowGit {
     for (const rel of missing) {
       await this.git(['rm', '--cached', '--ignore-unmatch', '--', rel], { allowFailure: true })
     }
+
+    return failures
   }
 
   private async git(args: string[], opts: { allowFailure?: boolean } = {}) {
@@ -775,12 +808,16 @@ function extractPathsFromToolEvent(
     case 'str_replace':
     case 'apply_patch':
       if (typeof a.path === 'string') return [a.path]
-      if (Array.isArray(a.edits)) {
-        return a.edits
-          .map((e) => (e && typeof e === 'object' && typeof (e as { path?: unknown }).path === 'string' ? (e as { path: string }).path : null))
-          .filter((p): p is string => Boolean(p))
-      }
-      return []
+      if (!Array.isArray(a.edits)) return []
+
+      return a.edits
+        .map((edit) => {
+          const entry = edit as { path?: unknown } | null
+          return entry && typeof entry === 'object' && typeof entry.path === 'string'
+            ? entry.path
+            : null
+        })
+        .filter((p): p is string => Boolean(p))
     case 'bash': {
       // Best-effort: parse rm/mv/cp/tee targets out of the command string.
       const cmd = typeof a.command === 'string' ? a.command : ''
@@ -797,26 +834,49 @@ function extractPathsFromToolEvent(
  * so we never stage unrelated files. Unknown commands contribute no paths
  * (the file change will still be caught on the next write/edit by the agent
  * touching the same file).
+ *
+ * Redirects (`>`, `>>`) and exotic commands are not parsed — a `shortcut:`
+ * trade-off, see README limitations.
  */
-function parseBashPaths(command: string): string[] {
+export const BASH_WRITERS: Record<string, (args: string[]) => string[]> = {
+  // Removes or (re)creates the path itself.
+  rm: (args) => args,
+  rmdir: (args) => args,
+  mkdir: (args) => args,
+  truncate: (args) => args,
+  tee: (args) => args,
+  // `mv` consumes the source and produces the destination: both change.
+  mv: (args) => args,
+  // `cp`/`install` only READ the sources, so tracking them would make a rewind
+  // delete the original. The destination is always the last argument.
+  cp: (args) => args.slice(-1),
+  install: (args) => args.slice(-1),
+  dd: (args) => args.filter((a) => a.startsWith('of=')).map((a) => a.slice(3)),
+}
+
+export function parseBashPaths(command: string): string[] {
   const paths: string[] = []
-  // Tokenize on whitespace, respecting simple double-quoted strings.
-  const tokens = command.match(/(?:[^\s"]+|"[^"]*")+/g) ?? []
-  for (let i = 0; i < tokens.length; i++) {
-    const tok = tokens[i].replace(/^"|"$/g, '')
-    // Recognise mutating commands and take subsequent non-flag tokens.
-    if (/^(rm|mv|cp|mkdir|rmdir|tee|truncate|dd|install)$/.test(tok)) {
-      for (let j = i + 1; j < tokens.length; j++) {
-        const next = tokens[j].replace(/^"|"$/g, '')
-        if (next.startsWith('-')) continue
-        // `mv`/`cp` take src dst — both are file paths worth tracking.
-        paths.push(next)
-        if (tok === 'rm' || tok === 'rmdir' || tok === 'mkdir') break
-      }
-      i = tokens.length
-    }
+
+  // Split into command segments so one command's arguments are not mistaken
+  // for the next command's.
+  for (const segment of command.split(/\s*(?:&&|\|\||[;|&])\s*/)) {
+    const tokens = tokenizeShell(segment)
+    if (tokens.length === 0) continue
+
+    const writer = BASH_WRITERS[path.posix.basename(tokens[0])]
+    if (!writer) continue
+
+    const args = tokens.slice(1).filter((token) => !token.startsWith('-'))
+    paths.push(...writer(args))
   }
+
   return paths
+}
+
+/** Split on whitespace, keeping single- and double-quoted runs together. */
+function tokenizeShell(segment: string): string[] {
+  const matches = segment.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []
+  return matches.map((token) => token.replace(/^["']|["']$/g, '')).filter(Boolean)
 }
 
 // ==========================================================================
@@ -924,12 +984,57 @@ function toShadowRel(file: string, cwd: string): string | undefined {
   return normalizeGitPath(rel)
 }
 
+/**
+ * Turn a tool-supplied path into a worktree-relative git path, or undefined if
+ * it points outside the worktree. `..` segments are collapsed first, so
+ * 'a/../../etc/passwd' is rejected instead of being handed to `git rm`.
+ */
 export function normalizeGitPath(file: string): string | undefined {
   if (!file || path.isAbsolute(file) || file.includes('\0')) return
-  const normalized = file.replaceAll('\\', '/')
-  if (normalized === '.' || normalized.startsWith('../') || normalized.includes('/../')) return
+
+  const normalized = path.posix.normalize(file.replaceAll('\\', '/'))
+  if (normalized === '.' || normalized === '..' || normalized.startsWith('../')) return
+  if (path.posix.isAbsolute(normalized)) return
   if (normalized === '.pi' || normalized.startsWith('.pi/')) return
-  return normalized
+
+  return normalized.replace(/\/+$/, '')
+}
+
+/** True when `rel` stays inside `cwd` after lexical normalisation. */
+export function isInsideWorktree(cwd: string, rel: string): boolean {
+  const root = path.resolve(cwd)
+  const inside = path.relative(root, path.resolve(root, rel))
+  return inside !== '' && !inside.startsWith('..') && !path.isAbsolute(inside)
+}
+
+/**
+ * Like `isInsideWorktree`, but also follows symlinks on the part of the path
+ * that exists on disk. Without this, `link/file` where `link` points outside
+ * the worktree would write or delete outside on restore.
+ */
+export function isSafeRestoreTarget(cwd: string, rel: string): boolean {
+  if (!isInsideWorktree(cwd, rel)) return false
+
+  let root: string
+  try {
+    root = realpathSync(cwd)
+  } catch {
+    return false
+  }
+
+  // Resolve the deepest ancestor that exists; the rest cannot escape by itself.
+  let probe = path.resolve(cwd, rel)
+  while (true) {
+    try {
+      const resolved = path.join(realpathSync(probe), path.relative(probe, path.resolve(cwd, rel)))
+      const inside = path.relative(root, resolved)
+      return inside !== '' && !inside.startsWith('..') && !path.isAbsolute(inside)
+    } catch {
+      const parent = path.dirname(probe)
+      if (parent === probe) return false
+      probe = parent
+    }
+  }
 }
 
 function unique(values: string[]) {
@@ -946,14 +1051,81 @@ function formatCheckpointLabel(cp: Checkpoint, index: number): string {
     minute: '2-digit',
     second: '2-digit',
   })
-  const prompt = truncate(cp.prompt, 60) || `Turn`
-  const fileCount = cp.files.length > 0 ? ` (${cp.files.length} file${cp.files.length === 1 ? '' : 's'})` : ''
+  const prompt = truncate(cp.prompt, 60) || 'Turn'
+  const files = cp.files.length
+  const fileCount = files > 0 ? ` (${files} file${files === 1 ? '' : 's'})` : ''
   return `#${index} [${time}] ${prompt}${fileCount}`
 }
 
 type ThemeLike = ExtensionCommandContext['ui']['theme']
 
 type CompletionItem = { value: string; label: string; description?: string }
+
+/**
+ * Pick the snapshot describing the file state at `targetId`, restricted to the
+ * branch that ends at `targetId` (the last entry of `branch`).
+ *
+ * Case 1: target IS a checkpoint's prompt → that checkpoint's before-snapshot.
+ * Case 2: target IS a checkpoint's final leaf → that checkpoint's after-snapshot.
+ * Case 3: target sits inside a turn → that turn's before-snapshot.
+ * Case 4: target sits between turns → the previous turn's after-snapshot.
+ */
+export function pickSnapshotForTarget(
+  branch: SessionEntry[],
+  targetId: string,
+  store: Map<string, Checkpoint>,
+): { checkpoint: Checkpoint; snapshot: string } | undefined {
+  const position = new Map(branch.map((entry, index) => [entry.id, index]))
+  if (!branch.some((entry) => entry.id === targetId)) return undefined
+
+  const branchUserIds = new Set(
+    branch.filter((e) => e.type === 'message' && e.message.role === 'user').map((e) => e.id),
+  )
+  const onBranch = orderByBranch(
+    branch,
+    [...store.values()].filter((c) => branchUserIds.has(c.userEntryId)),
+  )
+
+  const asUserEntry = onBranch.find((c) => c.userEntryId === targetId)
+  if (asUserEntry) {
+    return { checkpoint: asUserEntry, snapshot: asUserEntry.beforeSnapshot }
+  }
+
+  const asFinalLeaf = onBranch.find((c) => c.finalLeafId === targetId)
+  if (asFinalLeaf) {
+    return { checkpoint: asFinalLeaf, snapshot: asFinalLeaf.afterSnapshot }
+  }
+
+  const targetIdx = position.get(targetId)!
+  const insideTurn = onBranch.find((cp) => {
+    const start = position.get(cp.userEntryId)
+    const end = position.get(cp.finalLeafId)
+    return start !== undefined && end !== undefined && start < targetIdx && targetIdx <= end
+  })
+  if (insideTurn) {
+    return { checkpoint: insideTurn, snapshot: insideTurn.beforeSnapshot }
+  }
+
+  const preceding = onBranch.filter((cp) => position.get(cp.userEntryId)! < targetIdx).pop()
+  if (!preceding) return undefined
+  return { checkpoint: preceding, snapshot: preceding.afterSnapshot }
+}
+
+/**
+ * Sort checkpoints into branch order. `createdAt` is wall-clock and can only
+ * be trusted within one branch, so position on the branch wins.
+ */
+export function orderByBranch(
+  branch: SessionEntry[],
+  checkpoints: Checkpoint[],
+): Checkpoint[] {
+  const position = new Map(branch.map((entry, index) => [entry.id, index]))
+  return [...checkpoints].sort(
+    (a, b) =>
+      (position.get(a.userEntryId) ?? Number.MAX_SAFE_INTEGER) -
+      (position.get(b.userEntryId) ?? Number.MAX_SAFE_INTEGER),
+  )
+}
 
 export function collectBranchDiffFiles(
   branch: SessionEntry[],
@@ -1070,14 +1242,18 @@ export function summarizeByProject(entries: CacheEntry[]): string {
   const rows = [...byProject.entries()].sort((a, b) => b[1].bytes - a[1].bytes)
   const total = rows.reduce((sum, [, agg]) => sum + agg.bytes, 0)
   const width = Math.max(...rows.map(([, agg]) => formatBytes(agg.bytes).length))
-  const lines = rows.map(
-    ([project, agg]) =>
-      `  ${formatBytes(agg.bytes).padStart(width)}  ${project} (${agg.sessions} session${agg.sessions === 1 ? '' : 's'})`,
-  )
+
+  const lines = rows.map(([project, agg]) => {
+    const size = formatBytes(agg.bytes).padStart(width)
+    const sessions = `${agg.sessions} session${agg.sessions === 1 ? '' : 's'}`
+    return `  ${size}  ${project} (${sessions})`
+  })
+
+  const projectCount = `${rows.length} project${rows.length === 1 ? '' : 's'}`
   return [
     ...lines,
     '',
-    `  ${formatBytes(total).padStart(width)}  total across ${rows.length} project${rows.length === 1 ? '' : 's'}`,
+    `  ${formatBytes(total).padStart(width)}  total across ${projectCount}`,
   ].join('\n')
 }
 
@@ -1116,14 +1292,14 @@ async function measureDir(dir: string): Promise<number> {
 async function listCheckpointStores(currentKey: string): Promise<CacheEntry[]> {
   let dirs: Dirent[]
   try {
-    dirs = await readdir(CHECKPOINTS_DIR, { withFileTypes: true })
+    dirs = await readdir(checkpointsDir(), { withFileTypes: true })
   } catch {
     return []
   }
   const results: CacheEntry[] = []
   for (const dir of dirs) {
     if (!dir.isDirectory()) continue
-    const full = path.join(CHECKPOINTS_DIR, dir.name)
+    const full = path.join(checkpointsDir(), dir.name)
     const worktree = await readFile(path.join(full, 'config'), 'utf8')
       .then(parseGitWorktree)
       .catch(() => undefined)
@@ -1193,15 +1369,18 @@ async function manageCheckpointCache(ctx: ExtensionCommandContext) {
       ctx.ui.notify(`No snapshots older than ${days} day(s) (current session excluded).`, 'info')
       return
     }
-    const freedTotal = targets.reduce((sum, s) => sum + s.bytes, 0)
-    warning = `This permanently removes ${targets.length} snapshot store(s) older than ${days} day(s), freeing ${formatBytes(freedTotal)}. The current session is kept.`
+    const freedTotal = formatBytes(targets.reduce((sum, s) => sum + s.bytes, 0))
+    warning = `This permanently removes ${targets.length} snapshot store(s) older than ${days}`
+    warning += ` day(s), freeing ${freedTotal}. The current session is kept.`
   } else {
     targets = choice === DELETE_OTHERS ? stores.filter((s) => !s.current) : stores
-    const freedTotal = targets.reduce((sum, s) => sum + s.bytes, 0)
-    warning =
+    const freedTotal = formatBytes(targets.reduce((sum, s) => sum + s.bytes, 0))
+    warning = `This permanently removes ${targets.length} snapshot store(s) freeing ${freedTotal}.`
+
+    warning +=
       choice === DELETE_ALL
-        ? `This permanently removes ${targets.length} snapshot store(s) freeing ${formatBytes(freedTotal)}, including the current session. Undo/redo history for those sessions will be lost.`
-        : `This permanently removes ${targets.length} snapshot store(s) freeing ${formatBytes(freedTotal)}. The current session is kept.`
+        ? ' This includes the current session; undo/redo history for it will be lost.'
+        : ' The current session is kept.'
   }
 
   const ok = await ctx.ui.confirm('Delete checkpoint snapshots?', warning)

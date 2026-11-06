@@ -45,12 +45,26 @@ behaviour as `@ayulab/pi-rewind`'s `restoreOnTree: "ask"`.
 
 ## Limitations (same as Claude Code / Cline)
 
-- Bash `rm`/`mv` targets are parsed best-effort. Commands the parser doesn't
-  recognise contribute no paths, so file changes from exotic shell commands
-  may not be captured until the agent re-touches the file via `write`/`edit`.
+- Bash `rm`/`mv`/`cp` targets are parsed best-effort. Commands the parser does
+  not recognise (`>`, `>>`, exotic tools) contribute no paths, so file changes
+  from them may not be captured until the agent re-touches the file via
+  `write`/`edit`. `cp` and `install` record only their destination; recording
+  the source would make a rewind delete the original.
 - Files the agent never touches are not checkpointed and cannot be rewound.
 - "External changes" (edits made outside Pi) to **in-scope** files are
   overwritten on restore, exactly like Cursor.
+- Restore refuses paths that resolve outside the worktree, including through
+  symlinks.
+
+## Development
+
+```bash
+npm install
+npm test        # node:test suite, no extra runner
+npm run typecheck
+```
+
+`PI_SHADOW_REWIND_DIR` overrides the checkpoint store location (used by tests).
 
 ## Installation
 

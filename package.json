@@ -28,5 +28,12 @@
   "files": [
     "index.ts",
     "README.md"
-  ]
+  ],
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
 }
